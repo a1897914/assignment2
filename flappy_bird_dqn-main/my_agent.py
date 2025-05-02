@@ -1,135 +1,144 @@
 import numpy as np
+import random
+from collections import deque
 import pygame
 from pytorch_mlp import MLPRegression
 import argparse
 from console import FlappyBirdEnv
 
-STUDENT_ID = 'a1234567'
-DEGREE = 'UG'  # or 'PG'
+STUDENT_ID = 'a1897914'
+DEGREE = 'UG'
 
 
 class MyAgent:
     def __init__(self, show_screen=False, load_model_path=None, mode=None):
-        # do not modify these
         self.show_screen = show_screen
         if mode is None:
-            self.mode = 'train'  # mode is either 'train' or 'eval', we will set the mode of your agent to eval mode
+            self.mode = 'train'
         else:
             self.mode = mode
 
-        # modify these
-        self.storage = ...  # a data structure of your choice (D in the Algorithm 2)
-        # A neural network MLP model which can be used as Q
-        self.network = MLPRegression(input_dim=..., output_dim=..., learning_rate=...)
-        # network2 has identical structure to network1, network2 is the Q_f
-        self.network2 = MLPRegression(input_dim=..., output_dim=..., learning_rate=...)
-        # initialise Q_f's parameter by Q's, here is an example
+        
+        self.epsilon = 0.9
+        self.epsilon_decay = 0.995
+        self.epsilon_min = 0.05
+        self.n = 32 
+        self.discount_factor = 0.95
+
+        self.storage = deque(maxlen=2000)
+
+        input_dim = 5  
+        output_dim = 2  
+        lr = 1e-3
+
+        self.network = MLPRegression(input_dim=input_dim, output_dim=output_dim, learning_rate=lr)
+        self.network2 = MLPRegression(input_dim=input_dim, output_dim=output_dim, learning_rate=lr)
         MyAgent.update_network_model(net_to_update=self.network2, net_as_source=self.network)
 
-        self.epsilon = ...  # probability ε in Algorithm 2
-        self.n = ...  # the number of samples you'd want to draw from the storage each time
-        self.discount_factor = ...  # γ in Algorithm 2
-
-        # do not modify this
         if load_model_path:
             self.load_model(load_model_path)
 
-    def choose_action(self, state: dict, action_table: dict) -> int:
-        """
-        This function should be called when the agent action is requested.
-        Args:
-            state: input state representation (the state dictionary from the game environment)
-            action_table: the action code dictionary
-        Returns:
-            action: the action code as specified by the action_table
-        """
-        # following pseudocode to implement this function
-        a_t = ...
+        self.prev_state_vector = None
+        self.prev_state = None
+        self.prev_action = None
 
-        return a_t
+    def BUILD_STATE(self, state):
+        bird_y = state['bird_y'] / state['screen_height']
+        bird_velocity = (state['bird_velocity'] + 10) / 20
+        pipe = state['pipes'][0] if state['pipes'] else {'x': state['screen_width'], 'top': 0, 'bottom': state['screen_height']}
+        pipe_x_dist = (pipe['x'] - state['bird_x']) / state['screen_width']
+        pipe_top = pipe['top'] / state['screen_height']
+        pipe_bottom = pipe['bottom'] / state['screen_height']
+        return np.array([bird_y, bird_velocity, pipe_x_dist, pipe_top, pipe_bottom])
+
+    def REWARD(self, prev_state, next_state):
+        if next_state['done_type'] in ['hit_pipe', 'offscreen']:
+            return -100
+        elif next_state['score'] > prev_state['score']:
+            return 50
+        else:
+            return 1
+
+    def choose_action(self, state: dict, action_table: dict) -> int:
+        state_vector = self.BUILD_STATE(state)
+        self.prev_state_vector = state_vector
+        self.prev_state = state
+
+        if self.mode == 'train' and np.random.rand() < self.epsilon:
+            action = random.choice(list(action_table.values())[:2])  # jump or do_nothing
+        else:
+            q_values = self.network.predict(state_vector.reshape(1, -1))
+            action = np.argmax(q_values)
+
+        self.prev_action = action
+        return action
 
     def receive_after_action_observation(self, state: dict, action_table: dict) -> None:
-        """
-        This function should be called to notify the agent of the post-action observation.
-        Args:
-            state: post-action state representation (the state dictionary from the game environment)
-            action_table: the action code dictionary
-        Returns:
-            None
-        """
-        # following pseudocode to implement this function
+        if self.mode == 'eval':
+            return
+
+        next_state_vector = self.BUILD_STATE(state)
+        reward = self.REWARD(self.prev_state, state)
+        done = state['done']
+
+        q_next = self.network2.predict(next_state_vector.reshape(1, -1))
+        q_next_max = np.max(q_next)
+        target_q = reward if done else reward + self.discount_factor * q_next_max
+
+        self.storage.append((self.prev_state_vector, self.prev_action, target_q))
+
+        if len(self.storage) >= self.n:
+            self.replay_experience()
+
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+    def replay_experience(self):
+        batch = random.sample(self.storage, self.n)
+        X, Y, W = [], [], []
+        for state_vec, action, target_q in batch:
+            q_values = self.network.predict(state_vec.reshape(1, -1)).flatten()
+            q_values[action] = target_q
+            X.append(state_vec)
+            Y.append(q_values)
+            W.append([1, 1])
+        self.network.fit_step(np.array(X), np.array(Y), np.array(W))
 
     def save_model(self, path: str = 'my_model.ckpt'):
-        """
-        Save the MLP model. Unless you decide to implement the MLP model yourself, do not modify this function.
-
-        Args:
-            path: the full path to save the model weights, ending with the file name and extension
-
-        Returns:
-
-        """
         self.network.save_model(path=path)
 
     def load_model(self, path: str = 'my_model.ckpt'):
-        """
-        Load the MLP model weights.  Unless you decide to implement the MLP model yourself, do not modify this function.
-        Args:
-            path: the full path to load the model weights, ending with the file name and extension
-
-        Returns:
-
-        """
         self.network.load_model(path=path)
 
     @staticmethod
     def update_network_model(net_to_update: MLPRegression, net_as_source: MLPRegression):
-        """
-        Update one MLP model's model parameter by the parameter of another MLP model.
-        Args:
-            net_to_update: the MLP to be updated
-            net_as_source: the MLP to supply the model parameters
-
-        Returns:
-            None
-        """
         net_to_update.load_state_dict(net_as_source.state_dict())
 
 
 if __name__ == '__main__':
-
     parser = argparse.ArgumentParser()
     parser.add_argument('--level', type=int, default=1)
-
     args = parser.parse_args()
 
-    # bare-bone code to train your agent (you may extend this part as well, we won't run your agent training code)
     env = FlappyBirdEnv(config_file_path='config.yml', show_screen=True, level=args.level, game_length=10)
     agent = MyAgent(show_screen=True)
     episodes = 10000
     for episode in range(episodes):
         env.play(player=agent)
-
-        # env.score has the score value from the last play
-        # env.mileage has the mileage value from the last play
         print(env.score)
         print(env.mileage)
-
-        # store the best model based on your judgement
         agent.save_model(path='my_model.ckpt')
 
-        # you'd want to clear the memory after one or a few episodes
-        ...
+        if episode % 50 == 0: 
+            MyAgent.update_network_model(agent.network2, agent.network)
+        if episode % 100 == 0: 
+            agent.storage.clear()
 
-        # you'd want to update the fixed Q-target network (Q_f) with Q's model parameter after one or a few episodes
-        ...
-
-    # the below resembles how we evaluate your agent
     env2 = FlappyBirdEnv(config_file_path='config.yml', show_screen=False, level=args.level)
     agent2 = MyAgent(show_screen=False, load_model_path='my_model.ckpt', mode='eval')
 
     episodes = 10
-    scores = list()
+    scores = []
     for episode in range(episodes):
         env2.play(player=agent2)
         scores.append(env2.score)
